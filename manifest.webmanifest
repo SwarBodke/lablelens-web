@@ -1,0 +1,9 @@
+{
+  "name": "LableLens - Legal Metrology Inspection",
+  "short_name": "LableLens",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f3ee",
+  "theme_color": "#f4f3ee",
+  "description": "AI-assisted Legal Metrology compliance screening for packaged commodities."
+}
