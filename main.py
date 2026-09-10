@@ -254,7 +254,7 @@ def health():
         "tesseract_languages": e.ocr.languages,
         "tesseract_available": bool(e.ocr.tesseract_cmd),
         "onnxruntime_available": importlib.util.find_spec("onnxruntime") is not None,
-        "rapidocr_available": e.ocr._get_rapid() is not None,
+        "rapidocr_available": importlib.util.find_spec("rapidocr") is not None,
         "ocr_mode": e.ocr.mode,
         "tesseract_fast_confidence_threshold": e.ocr.tesseract_fast_confidence_threshold,
         "tesseract_fast_coverage_threshold": e.ocr.tesseract_fast_coverage_threshold,
