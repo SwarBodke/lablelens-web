@@ -1,8 +1,13 @@
-"""Generate truthful PDF/DOCX/JSON screening reports from stored inspections."""
+"""Generate PDF/DOCX/JSON screening reports without exposing raw OCR transcript.
+
+Raw OCR text remains stored internally for audit/debugging, but report exports
+contain structured evidence and rule results only.
+"""
 from __future__ import annotations
 
 import io
 import json
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Dict
 
@@ -29,12 +34,45 @@ def _ocr_label(record: Dict[str, Any]) -> str:
         return str(value)
 
 
+def _report_safe_inspection(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy suitable for export, excluding raw transcription fields."""
+    safe = deepcopy(record)
+    for key in (
+        "raw_text",
+        "lines",
+        "ocr_transcript",
+        "transcript",
+        "unit_sale_price",
+        "unit_sale_price_screen",
+    ):
+        safe.pop(key, None)
+
+    # Defensive removal from nested check/evidence structures in case an older
+    # stored inspection is exported after the ruleset migration.
+    checks = safe.get("checks")
+    if isinstance(checks, dict):
+        for check in checks.values():
+            if not isinstance(check, dict):
+                continue
+            evidence = check.get("evidence")
+            if isinstance(evidence, dict):
+                evidence.pop("unit_sale_price", None)
+                evidence.pop("unit_sale_price_screen", None)
+            subs = check.get("subchecks")
+            if isinstance(subs, list):
+                check["subchecks"] = [
+                    sub for sub in subs
+                    if not (isinstance(sub, dict) and str(sub.get("name") or "").strip().lower() == "unit sale price")
+                ]
+    return safe
+
+
 def report_payload(record: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "report_generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "report_type": "Legal Metrology screening aid - not an enforcement order",
         "ruleset": ruleset_metadata(),
-        "inspection": record,
+        "inspection": _report_safe_inspection(record),
     }
 
 
@@ -50,6 +88,26 @@ def _audit_rows(record: Dict[str, Any]):
     ]
 
 
+def _checks(record: Dict[str, Any]) -> Dict[str, Any]:
+    checks = record.get("checks") or {}
+    if isinstance(checks, str):
+        try:
+            checks = json.loads(checks)
+        except Exception:
+            checks = {}
+    return checks if isinstance(checks, dict) else {}
+
+
+def _evidence(record: Dict[str, Any]):
+    evidence = record.get("evidence") or []
+    if isinstance(evidence, str):
+        try:
+            evidence = json.loads(evidence)
+        except Exception:
+            evidence = []
+    return evidence if isinstance(evidence, list) else []
+
+
 def build_pdf(record: Dict[str, Any]) -> bytes:
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4
@@ -60,12 +118,13 @@ def build_pdf(record: Dict[str, Any]) -> bytes:
     doc = SimpleDocTemplate(out, pagesize=A4, rightMargin=34, leftMargin=34, topMargin=32, bottomMargin=32)
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(name="Small", parent=styles["BodyText"], fontSize=8.5, leading=11))
+    rules = ruleset_metadata()
     story = [
         Paragraph("LableLens - Legal Metrology Screening Report", styles["Title"]),
         Paragraph(f"Inspection INS-{record.get('id', '-')}", styles["Heading2"]),
         Paragraph(
-            "Evidence-led screening under the Legal Metrology (Packaged Commodities) Rules, 2011. "
-            "The six groups are a practical automation baseline and this report is not an enforcement order or a substitute for current Gazette text, exemptions or category-specific law.",
+            "Screening against the original Legal Metrology (Packaged Commodities) Rules, 2011 baseline notified by G.S.R. 202(E). "
+            "This historical baseline intentionally excludes later amendments and is not an enforcement order or a statement of the fully amended current law.",
             styles["Small"],
         ),
         Spacer(1, 10),
@@ -79,7 +138,7 @@ def build_pdf(record: Dict[str, Any]) -> bytes:
         ["Created", _safe(record.get("created_at"))],
         ["OCR confidence", _ocr_label(record)],
         ["Extraction completeness", f"{record.get('extraction_completeness', 0)}%"],
-        ["Ruleset", record.get("ruleset_id") or ruleset_metadata()["id"]],
+        ["Ruleset", record.get("ruleset_id") or rules["id"]],
     ] + _audit_rows(record)
     t = Table(summary_rows, colWidths=[130, 380])
     t.setStyle(TableStyle([
@@ -94,15 +153,9 @@ def build_pdf(record: Dict[str, Any]) -> bytes:
         ("TOPPADDING", (0, 0), (-1, -1), 5),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ]))
-    story.extend([t, Spacer(1, 14), Paragraph("Six core check groups", styles["Heading2"])])
+    story.extend([t, Spacer(1, 14), Paragraph("Six rule-engine groups", styles["Heading2"])])
 
-    checks = record.get("checks") or {}
-    if isinstance(checks, str):
-        try:
-            checks = json.loads(checks)
-        except Exception:
-            checks = {}
-    for key, item in checks.items():
+    for key, item in _checks(record).items():
         if not isinstance(item, dict):
             continue
         title = item.get("title") or key.replace("_", " ").title()
@@ -116,22 +169,14 @@ def build_pdf(record: Dict[str, Any]) -> bytes:
             story.append(Paragraph(f"- {escaped}", styles["Small"]))
         story.append(Spacer(1, 5))
 
-    story.extend([Spacer(1, 10), Paragraph("Transcription / listing evidence", styles["Heading2"])])
-    raw = str(record.get("raw_text") or "No transcription stored.")[:12000]
-    raw = raw.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br/>")
-    story.append(Paragraph(raw, styles["Small"]))
-
-    evidence = record.get("evidence") or []
-    if isinstance(evidence, str):
-        try:
-            evidence = json.loads(evidence)
-        except Exception:
-            evidence = []
+    evidence = _evidence(record)
     if evidence:
         story.extend([Spacer(1, 10), Paragraph("Image evidence hashes", styles["Heading2"])])
         for ev in evidence:
-            story.append(Paragraph(f"SHA-256: {_safe(ev.get('sha256'))} ({ev.get('bytes', 0)} bytes)", styles["Small"]))
+            if isinstance(ev, dict):
+                story.append(Paragraph(f"SHA-256: {_safe(ev.get('sha256'))} ({ev.get('bytes', 0)} bytes)", styles["Small"]))
 
+    # Intentionally no OCR transcription/raw-text section in exported reports.
     doc.build(story)
     return out.getvalue()
 
@@ -143,8 +188,8 @@ def build_docx(record: Dict[str, Any]) -> bytes:
     doc.add_heading("LableLens - Legal Metrology Screening Report", level=0)
     doc.add_paragraph(f"Inspection INS-{record.get('id', '-')}")
     doc.add_paragraph(
-        "Evidence-led screening under the Legal Metrology (Packaged Commodities) Rules, 2011. "
-        "This is a screening aid, not an enforcement order or a substitute for current Gazette text and applicable category-specific law."
+        "Screening against the original Legal Metrology (Packaged Commodities) Rules, 2011 baseline notified by G.S.R. 202(E). "
+        "This historical baseline intentionally excludes later amendments and is not an enforcement order or a statement of the fully amended current law."
     )
     table = doc.add_table(rows=0, cols=2)
     table.style = "Table Grid"
@@ -170,14 +215,8 @@ def build_docx(record: Dict[str, Any]) -> bytes:
         for key, value in audit:
             doc.add_paragraph(f"{key}: {value}")
 
-    doc.add_heading("Six core check groups", level=1)
-    checks = record.get("checks") or {}
-    if isinstance(checks, str):
-        try:
-            checks = json.loads(checks)
-        except Exception:
-            checks = {}
-    for key, item in checks.items():
+    doc.add_heading("Six rule-engine groups", level=1)
+    for key, item in _checks(record).items():
         if not isinstance(item, dict):
             continue
         doc.add_heading(
@@ -190,19 +229,14 @@ def build_docx(record: Dict[str, Any]) -> bytes:
         for issue in item.get("issues") or []:
             doc.add_paragraph(str(issue), style="List Bullet")
 
-    doc.add_heading("Transcription / listing evidence", level=1)
-    doc.add_paragraph(str(record.get("raw_text") or "No transcription stored.")[:12000])
-    evidence = record.get("evidence") or []
-    if isinstance(evidence, str):
-        try:
-            evidence = json.loads(evidence)
-        except Exception:
-            evidence = []
+    evidence = _evidence(record)
     if evidence:
         doc.add_heading("Image evidence hashes", level=1)
         for ev in evidence:
-            doc.add_paragraph(f"SHA-256: {ev.get('sha256')} ({ev.get('bytes', 0)} bytes)", style="List Bullet")
+            if isinstance(ev, dict):
+                doc.add_paragraph(f"SHA-256: {ev.get('sha256')} ({ev.get('bytes', 0)} bytes)", style="List Bullet")
 
+    # Intentionally no OCR transcription/raw-text section in exported reports.
     out = io.BytesIO()
     doc.save(out)
     return out.getvalue()
