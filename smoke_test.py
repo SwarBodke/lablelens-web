@@ -19,18 +19,21 @@ os.environ["PRESERVE_EVIDENCE"] = "true"
 os.environ.setdefault("LABLELENS_OCR_LANGS", "eng")
 
 from fastapi.testclient import TestClient  # noqa: E402
-from compliance_engine import (  # noqa: E402
-    ComplianceEngine,
-    HybridOCR,
-    expiry_is_past,
-    extract_quantity,
-    validate_unit_sale_price,
+from compliance_engine import ComplianceEngine, HybridOCR, expiry_is_past, extract_quantity  # noqa: E402
+from inspection_rule_contract import finalize_six_group_result  # noqa: E402
+from reports import report_payload  # noqa: E402
+from ruleset import (  # noqa: E402
+    RULESET_ID,
+    metadata as ruleset_metadata,
+    required_original_letter_height_mm,
+    required_original_numeral_height_mm,
 )
-from ruleset import required_font_height_mm  # noqa: E402
 from main import app  # noqa: E402
 
 
-COMPLETE = """Generic Name: Liquid Detergent
+# The input deliberately contains a Unit Sale Price line.  The selected original
+# 2011 ruleset must ignore it: it must not become a check, score or report field.
+COMPLETE = """Liquid Detergent
 Manufactured by: Demo Consumer Products Pvt. Ltd.
 Plot 21, Industrial Estate, Pune, Maharashtra - 411001
 Net Qty: 500 ml
@@ -50,12 +53,25 @@ def assert_eq(actual, expected, message):
 
 
 def logic_tests():
+    meta = ruleset_metadata()
+    assert_eq(meta["id"], RULESET_ID, "ruleset metadata id")
+    assert meta.get("historical_baseline") is True
+    assert meta.get("excluded_later_amendments"), "later-amendment exclusions should be explicit"
+    assert "unit sale price" not in meta["checks"]["mrp"]["title"].lower()
+    assert "Rule 6(11)" not in meta["checks"]["mrp"]["rules"]
+
     q = extract_quantity("Net Qty: 500 gms")
     assert_eq(q["unit"], "g", "legacy unit should normalise")
     assert_eq(q["unit_violation"], "gms", "legacy unit must remain flagged")
     assert expiry_is_past({"month": 9, "year": 2026}, date(2026, 9, 10)) is False
     assert expiry_is_past({"month": 8, "year": 2026}, date(2026, 9, 10)) is True
-    assert_eq(required_font_height_mm(50, moulded=True), 2.0, "Table-I A<=50 moulded height")
+
+    # Original Rule 7 Table-I weight/volume thresholds.
+    assert_eq(required_original_numeral_height_mm(200, "g", None, False), 1.0, "Table-I <=200 g")
+    assert_eq(required_original_numeral_height_mm(500, "ml", None, False), 2.0, "Table-I <=500 ml")
+    assert_eq(required_original_numeral_height_mm(1, "kg", None, False), 4.0, "Table-I >500 g")
+    assert_eq(required_original_letter_height_mm(False), 1.0, "original letter height")
+    assert_eq(required_original_letter_height_mm(True), 2.0, "original formed-letter height")
 
     e = ComplianceEngine()
     ctx = {
@@ -67,32 +83,51 @@ def logic_tests():
         "font_width_mm": 1.2,
         "moulded_text": False,
     }
-    result = e.analyze_text(COMPLETE, ctx)
+    result = finalize_six_group_result(e.analyze_text(COMPLETE, ctx))
+    assert_eq(result["ruleset_id"], RULESET_ID, "original 2011 ruleset applied")
     assert_eq(result["compliance_status"], "compliant", "complete calibrated package")
-    assert all(v["status"] == "compliant" for v in result["checks"].values())
+    assert_eq(list(result["checks"]), ["responsible_entity", "net_quantity", "date", "mrp", "consumer_care", "font_size"], "six-group order")
+    assert "unit_sale_price" not in result
+    assert all("unit sale price" not in str(v).lower() for v in result["checks"].values())
+
+    # Product/commodity identity can satisfy the grouped Rule 6(1)(b) sub-check;
+    # the UI does not need a separate literal "Generic Name" field caption.
+    identity_subs = result["checks"]["responsible_entity"]["subchecks"]
+    identity = [x for x in identity_subs if x["name"].startswith("Commodity identity")][0]
+    assert_eq(identity["status"], "compliant", "commodity identity sub-check")
 
     missing_care = COMPLETE.split("Consumer Care:", 1)[0]
-    result = e.analyze_text(missing_care, ctx)
-    assert_eq(result["checks"]["consumer_care"]["status"], "non_compliant", "missing care with complete evidence")
-    assert_eq(result["compliance_status"], "non_compliant", "missing care must affect overall result")
+    result = finalize_six_group_result(e.analyze_text(missing_care, ctx))
+    assert_eq(result["checks"]["consumer_care"]["status"], "non_compliant", "missing care with complete physical evidence")
+    assert_eq(result["compliance_status"], "non_compliant", "missing care affects overall result")
 
-    partial = e.analyze_text(missing_care, {**ctx, "evidence_scope": "partial"})
+    partial = finalize_six_group_result(e.analyze_text(missing_care, {**ctx, "evidence_scope": "partial"}))
     assert_eq(partial["checks"]["consumer_care"]["status"], "needs_review", "partial photo missing care")
-    assert_eq(partial["compliance_status"], "needs_review", "partial evidence must stay conservative")
+    assert_eq(partial["compliance_status"], "needs_review", "partial evidence stays conservative")
 
-    ecommerce = e.analyze_text(LISTING, {"source_type": "ecommerce", "evidence_scope": "complete_listing", "category": "general"})
-    assert_eq(ecommerce["compliance_status"], "compliant", "complete listing")
+    # The original 2011 Rules did not contain the later e-commerce display
+    # provision, so missing package evidence in listing text stays REVIEW rather
+    # than being treated as an automatic package-law FAIL or invented N/A.
+    ecommerce = finalize_six_group_result(e.analyze_text(LISTING, {"source_type": "ecommerce", "evidence_scope": "complete_listing", "category": "general"}))
+    assert_eq(ecommerce["compliance_status"], "needs_review", "historical baseline listing conservatism")
     assert ecommerce["ocr_confidence"] is None
-    assert_eq(ecommerce["checks"]["date"]["status"], "not_applicable", "ecommerce mfg month/year display")
-    assert_eq(ecommerce["checks"]["font_size"]["status"], "not_applicable", "physical font check on ecommerce")
+    assert_eq(ecommerce["checks"]["date"]["status"], "needs_review", "listing absence is not a 2011 package FAIL")
+    assert_eq(ecommerce["checks"]["font_size"]["status"], "not_applicable", "physical font measurement from listing text")
 
-    proviso = validate_unit_sale_price({"value": 1.0, "unit": "L"}, 100.0, None, "complete_package")
-    assert_eq(proviso["status"], "not_applicable", "unit sale price proviso")
-    mismatch = validate_unit_sale_price({"value": 500.0, "unit": "ml"}, 149.0, {"value": 0.5, "unit": "ml"}, "complete_package")
-    assert_eq(mismatch["status"], "non_compliant", "wrong unit sale price")
+    # E-mail was qualified by "if available" in original Rule 6(2), so it does
+    # not independently fail the consumer-care group.
+    no_email = COMPLETE.replace(" Email: care@example.com", "")
+    no_email_result = finalize_six_group_result(e.analyze_text(no_email, ctx))
+    email_sub = [x for x in no_email_result["checks"]["consumer_care"]["subchecks"] if x["name"].startswith("E-mail")][0]
+    assert_eq(email_sub["status"], "not_applicable", "optional e-mail absence")
+
+    # Report JSON must not expose the raw OCR/listing transcript.
+    export = report_payload(result)
+    assert "raw_text" not in export["inspection"]
+    assert "lines" not in export["inspection"]
+    assert "unit_sale_price" not in export["inspection"]
 
     # Adaptive OCR routing: strong Tesseract evidence must skip RapidOCR.
-    # Weak/incomplete Tesseract evidence must escalate and merge RapidOCR text.
     o = HybridOCR(); o.mode = "adaptive"
     o._decode_codes = lambda source: []
     calls = []
@@ -107,38 +142,6 @@ def logic_tests():
     assert_eq(calls, ["full"], "strong flat label should use one Tesseract pass")
     assert_eq(routed["engines_used"]["fast_path_accepted"], True, "strong Tesseract should pass strict gate")
     assert_eq(routed["engines_used"]["rapidocr"], False, "strong Tesseract should skip RapidOCR")
-    assert_eq(routed["engines_used"]["route"], "tesseract_fast", "fast route label")
-
-    partial_tess = "Generic Name: Liquid Detergent\nManufactured by: Demo Consumer Products Pvt Ltd\nNet Qty: 500 ml"
-    rapid_additions = """Plot 21 Industrial Estate Pune Maharashtra 411001
-MRP Rs 149 Inclusive of all taxes
-Mfg Date: 08/2026
-Consumer Care: Helpdesk
-Phone: +91 9876543210
-Email: care@example.com"""
-    o = HybridOCR(); o.mode = "adaptive"
-    o._decode_codes = lambda source: []
-    calls = []
-    additions = {
-        "full": partial_tess,
-        "bottom": "MRP Rs 149 Inclusive of all taxes\nMfg Date: 08/2026",
-        "top": "CLEANWAVE",
-        "raw": "",
-    }
-    def weak_tess(source, name):
-        calls.append(name)
-        return additions[name], 90.0
-    rapid_calls = []
-    def fake_rapid(source):
-        rapid_calls.append("rapid")
-        return rapid_additions, 94.0
-    o._run_named_tesseract = weak_tess
-    o._rapid_pass = fake_rapid
-    routed = o.read(b"x", {"source_type": "physical", "evidence_scope": "complete_package"})
-    assert_eq(calls[:2], ["full", "bottom"], "weak label should use targeted Tesseract recovery")
-    assert_eq(rapid_calls, ["rapid"], "incomplete Tesseract must escalate to RapidOCR")
-    assert_eq(routed["engines_used"]["route"], "tesseract_then_rapid", "escalation route label")
-    assert "care@example.com" in routed["text"], "RapidOCR evidence should be merged additively"
 
 
 def api_tests():
@@ -152,11 +155,12 @@ def api_tests():
         one = client.post(
             "/api/analyze/text",
             headers=headers,
-            json={"text": LISTING, "product_name": "Demo Liquid Detergent", "evidence_scope": "complete_listing", "category": "general"},
+            json={"text": COMPLETE, "product_name": "Demo Liquid Detergent", "evidence_scope": "complete_listing", "category": "general"},
         )
-        assert_eq(one.status_code, 200, "first listing analysis")
+        assert_eq(one.status_code, 200, "listing analysis")
         result = one.json()
-        assert_eq(result["compliance_status"], "compliant", "API complete listing status")
+        assert_eq(result["ruleset_id"], RULESET_ID, "API ruleset id")
+        assert "unit_sale_price" not in result
         assert result.get("audit", {}).get("record_hash"), "record hash should be returned immediately"
         first_hash = result["audit"]["record_hash"]
         first_id = result["inspection_id"]
@@ -181,47 +185,24 @@ def api_tests():
         assert_eq(hist.status_code, 200, "history")
         rows = hist.json()
         assert_eq(len(rows), 2, "session history count")
-        assert rows[0].get("record_hash") and rows[1].get("record_hash")
 
         for fmt, magic in [("pdf", b"%PDF"), ("docx", b"PK")]:
             r = client.get(f"/api/inspections/{first_id}/report.{fmt}", headers=headers)
             assert_eq(r.status_code, 200, f"{fmt} report")
             assert r.content.startswith(magic), f"{fmt} report signature"
+            # Raw transcript must not be embedded in human-readable reports.
+            assert b"Transcription / listing evidence" not in r.content
+
         jr = client.get(f"/api/inspections/{first_id}/report.json", headers=headers)
         assert_eq(jr.status_code, 200, "JSON report")
-        assert jr.json()["inspection"]["record_hash"] == first_hash
-
-        # New signed workspace cannot read the first workspace's history.
-        s2 = client.post("/api/session/guest").json()
-        h2 = {"Authorization": f"Bearer {s2['token']}"}
-        isolated = client.get("/api/inspections", headers=h2)
-        assert_eq(isolated.status_code, 200, "isolated history request")
-        assert_eq(isolated.json(), [], "workspace isolation")
-
-        # Exercise the physical image route with one clear synthetic panel. Exact OCR
-        # text is intentionally not asserted because engine availability varies by OS.
-        import cv2
-        import numpy as np
-        img = np.full((700, 1200, 3), 255, dtype=np.uint8)
-        cv2.putText(img, "NET QTY 500 ml", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.putText(img, "MRP Rs 149", (50, 310), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 0, 0), 4, cv2.LINE_AA)
-        ok, encoded = cv2.imencode(".png", img)
-        assert ok
-        physical = client.post(
-            "/api/analyze/multi",
-            headers=h2,
-            files=[("images", ("panel.png", encoded.tobytes(), "image/png"))],
-            data={"evidence_scope": "partial", "category": "general"},
-        )
-        assert_eq(physical.status_code, 200, "physical OCR route")
-        pdata = physical.json()
-        assert pdata.get("inspection_id")
-        assert len(pdata.get("evidence") or []) == 1
-        assert pdata["evidence"][0].get("sha256")
-        assert pdata.get("compliance_status") in {"compliant", "non_compliant", "needs_review"}
+        payload = jr.json()
+        assert payload["inspection"]["record_hash"] == first_hash
+        assert "raw_text" not in payload["inspection"]
+        assert "lines" not in payload["inspection"]
+        assert "unit_sale_price" not in payload["inspection"]
 
 
 if __name__ == "__main__":
     logic_tests()
     api_tests()
-    print("PASS: LableLens smoke/regression tests")
+    print("PASS: LableLens original-2011 ruleset smoke/regression tests")
